@@ -5,6 +5,7 @@ import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.otaku.poet.jni.NativePoet
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
@@ -45,8 +46,24 @@ class PoetViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** 重新扫描挂载目录并打开目标包。 */
+    /**
+     * 生成过程中禁止切换 / 导入 / 删除词库包。
+     * 这些操作会替换或释放引擎句柄，而生成协程仍在向旧句柄取段落。
+     */
+    private fun ensureIdle(action: String): Boolean {
+        if (!_state.value.busy) return true
+        _state.update { it.copy(message = "生成中，请等本次创作完成后再$action") }
+        return false
+    }
+
+    /** 重新扫描挂载目录并打开目标包。生成过程中不切换：旧句柄仍被生成协程使用。 */
     fun refresh(preferPath: String? = null, params: GenParams? = null) {
+        if (!ensureIdle("切换词库包")) return
+        refreshInternal(preferPath, params)
+    }
+
+    /** 重新扫描挂载目录并打开目标包（不做 busy 检查，供内部流程调用）。 */
+    private fun refreshInternal(preferPath: String? = null, params: GenParams? = null) {
         val packs = try {
             repo.listPacks()
         } catch (e: Throwable) {
@@ -100,27 +117,32 @@ class PoetViewModel(app: Application) : AndroidViewModel(app) {
             _state.update { it.copy(message = "尚未挂载词库包，请先在“词库管理”中导入") }
             return
         }
-        viewModelScope.launch {
-            val current = _state.value.params
-            val seed = current.seed ?: (random.nextLong() ushr 1)
-            val params = current.copy(seed = seed)
-            val ctx = getApplication<Application>()
-            val showInUi = params.showInUi
+        // 连点保护：busy 在启动协程前同步置位，避免两次生成并发操作同一个 native 会话。
+        if (_state.value.busy) return
+        _state.update {
+            it.copy(
+                busy = true,
+                poem = null,
+                generatingProgress = 0,
+                generatingTotal = it.params.paragraphs,
+            )
+        }
 
-            _state.update {
-                it.copy(
-                    busy = true,
-                    poem = null,
-                    generatingProgress = 0,
-                    generatingTotal = params.paragraphs,
-                )
-            }
+        // 生成循环里有 JNI 阻塞调用与文件写入，必须离开主线程，否则界面冻结 / ANR。
+        viewModelScope.launch(Dispatchers.IO) {
+            val current = _state.value.params
+            // 「留空 = 每次随机」：随机种子只用于本次生成，不回写参数、不持久化，
+            // 否则之后的每次创作都会复用同一颗种子，生成完全相同的诗。
+            val seed = current.seed ?: (random.nextLong() ushr 1)
+            val genJson = current.copy(seed = seed).toJson()
+            val ctx = getApplication<Application>()
+            val showInUi = current.showInUi
 
             var writer: PoemWriter? = null
             var memoryStopped = false
             try {
                 // 1. 开始流式生成，获取标题
-                val beginJson = JSONObject(NativePoet.beginGenerate(handle, params.toJson()))
+                val beginJson = JSONObject(NativePoet.beginGenerate(handle, genJson))
                 val title = if (beginJson.isNull("title")) null
                 else beginJson.optString("title").ifEmpty { null }
                 val actualSeed = beginJson.optLong("seed", seed)
@@ -135,9 +157,9 @@ class PoetViewModel(app: Application) : AndroidViewModel(app) {
 
                 // UI 更新间隔：总段数越多间隔越大，目标总共更新约 200 次，
                 // 避免千万次级 StateFlow 更新导致主线程阻塞 / OOM。
-                val uiUpdateInterval = maxOf(1, params.paragraphs / 200)
-                // 内存检查间隔：至少每 100 段，大篇幅时更稀疏。
-                val memCheckInterval = maxOf(100, params.paragraphs / 1000)
+                val uiUpdateInterval = maxOf(1, current.paragraphs / 200)
+                // 内存检查间隔：至少每 MemoryGuard.CHECK_INTERVAL 段，大篇幅时更稀疏。
+                val memCheckInterval = maxOf(MemoryGuard.CHECK_INTERVAL, current.paragraphs / 1000)
 
                 // 3. 逐段生成
                 var index = 0
@@ -156,7 +178,7 @@ class PoetViewModel(app: Application) : AndroidViewModel(app) {
                     index++
 
                     // 按间隔更新 UI，避免高频重组
-                    if (index % uiUpdateInterval == 0 || index == params.paragraphs) {
+                    if (index % uiUpdateInterval == 0 || index == current.paragraphs) {
                         if (showInUi) {
                             paragraphs!!.add(lines)
                             rhymes!!.add(rhyme)
@@ -181,7 +203,7 @@ class PoetViewModel(app: Application) : AndroidViewModel(app) {
 
                     // 内存检查
                     if (index % memCheckInterval == 0 &&
-                        MemoryGuard.isOverLimit(ctx, params.memoryLimitPercent)
+                        MemoryGuard.isOverLimit(ctx, current.memoryLimitPercent)
                     ) {
                         memoryStopped = true
                         break
@@ -192,14 +214,17 @@ class PoetViewModel(app: Application) : AndroidViewModel(app) {
                 val warningsArr = org.json.JSONArray(NativePoet.endGenerate(handle))
                 val warnings = List(warningsArr.length()) { warningsArr.getString(it) }
 
-                settings.saveParams(params)
-
                 // 5. 完成写入（元信息 + 关闭流）
                 writer.finish(activePack?.name ?: "", actualSeed)
 
-                val saveMsg = "已保存：Download/cyberpoet/${writer.fileName}（共 $index 段）"
+                // 持久化用户参数（生成期间可能已改动，且本次随机种子不回写）。
+                // 放在写完文件之后：此处是挂起点，若被取消不该影响已完成的诗作。
+                settings.saveParams(_state.value.params)
+
+                val saveMsg =
+                    "已保存：Download/cyberpoet/${writer.fileName}（共 $index 段，种子 $actualSeed）"
                 val stopMsg = if (memoryStopped)
-                    "内存达到上限（可用内存${params.memoryLimitPercent}%），已停止，已生成 $index 段并保存"
+                    "内存达到上限（可用内存${current.memoryLimitPercent}%），已停止，已生成 $index 段并保存"
                 else null
 
                 if (showInUi) {
@@ -215,7 +240,6 @@ class PoetViewModel(app: Application) : AndroidViewModel(app) {
                     _state.update {
                         it.copy(
                             busy = false,
-                            params = params,
                             poem = finalPoem,
                             generatingProgress = 0,
                             generatingTotal = 0,
@@ -227,7 +251,6 @@ class PoetViewModel(app: Application) : AndroidViewModel(app) {
                     _state.update {
                         it.copy(
                             busy = false,
-                            params = params,
                             poem = null,
                             generatingProgress = 0,
                             generatingTotal = 0,
@@ -250,31 +273,43 @@ class PoetViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun importZip(uri: Uri) = viewModelScope.launch {
+    fun importZip(uri: Uri) {
+        if (!ensureIdle("导入词库包")) return
+        // 同步置位 busy：避免与生成或另一次导入并发争用引擎句柄。
         _state.update { it.copy(busy = true) }
-        runCatching { repo.importZip(uri) }
-            .onSuccess { pack ->
-                _state.update { it.copy(busy = false, message = "已导入：${pack.name}") }
-                refresh(pack.path)
-            }
-            .onFailure { e ->
-                _state.update { it.copy(busy = false, message = "导入失败：${e.message}") }
-            }
+        // 解压与拷贝是阻塞 IO，放到后台线程执行。
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { repo.importZip(uri) }
+                .onSuccess { pack ->
+                    // 重新挂载完成前保持 busy：避免此刻开始的生成与换包争用引擎句柄。
+                    refreshInternal(pack.path)
+                    _state.update { it.copy(busy = false, message = "已导入：${pack.name}") }
+                }
+                .onFailure { e ->
+                    _state.update { it.copy(busy = false, message = "导入失败：${e.message}") }
+                }
+        }
     }
 
-    fun importTree(uri: Uri) = viewModelScope.launch {
+    fun importTree(uri: Uri) {
+        if (!ensureIdle("导入词库包")) return
+        // 同步置位 busy：避免与生成或另一次导入并发争用引擎句柄。
         _state.update { it.copy(busy = true) }
-        runCatching { repo.importTree(uri) }
-            .onSuccess { pack ->
-                _state.update { it.copy(busy = false, message = "已导入：${pack.name}") }
-                refresh(pack.path)
-            }
-            .onFailure { e ->
-                _state.update { it.copy(busy = false, message = "导入失败：${e.message}") }
-            }
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { repo.importTree(uri) }
+                .onSuccess { pack ->
+                    // 重新挂载完成前保持 busy：避免此刻开始的生成与换包争用引擎句柄。
+                    refreshInternal(pack.path)
+                    _state.update { it.copy(busy = false, message = "已导入：${pack.name}") }
+                }
+                .onFailure { e ->
+                    _state.update { it.copy(busy = false, message = "导入失败：${e.message}") }
+                }
+        }
     }
 
     fun deletePack(path: String) {
+        if (!ensureIdle("删除词库包")) return
         val activePath = _state.value.active?.path
         repo.deletePack(path)
         refresh(if (path != activePath) activePath else null)
@@ -283,7 +318,12 @@ class PoetViewModel(app: Application) : AndroidViewModel(app) {
     /** 收藏当前诗作到 App 私有目录。 */
     fun favorite(poem: PoemResult) {
         val dir = File(getApplication<Application>().filesDir, "favorites").apply { mkdirs() }
-        val name = (poem.title ?: "无题") + "-" + poem.seed + ".txt"
+        // 标题由词库模板填出，可能含 / 等文件名非法字符，需过滤后再作文件名。
+        val title = (poem.title ?: "无题")
+            .replace(Regex("[\\\\/:*?\"<>|\r\n\t]"), "_")
+            .take(60)
+            .ifBlank { "无题" }
+        val name = "$title-${poem.seed}.txt"
         File(dir, name).writeText(poem.fullText)
         _state.update { it.copy(message = "已收藏：$name") }
     }
@@ -292,6 +332,10 @@ class PoetViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         super.onCleared()
-        if (handle != 0L) runCatching { NativePoet.close(handle) }
+        // 生成中不释放句柄：后台生成协程可能仍在调用它，交给进程回收以避免悬空指针。
+        if (handle != 0L && !_state.value.busy) {
+            runCatching { NativePoet.close(handle) }
+            handle = 0L
+        }
     }
 }

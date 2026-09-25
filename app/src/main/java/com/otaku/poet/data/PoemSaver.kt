@@ -14,7 +14,7 @@ import java.util.Locale
 
 /**
  * 把诗作以 txt 写入公共下载目录的 cyberpoet 子目录：
- *   /sdcard/Download/cyberpoet/poem_yyyyMMdd_HHmmss.txt
+ *   /sdcard/Download/cyberpoet/poem_yyyyMMdd_HHmmss_SSS.txt
  *
  * 支持两种模式：
  * - [save]：一次性写入整首诗（兼容旧接口）；
@@ -40,21 +40,14 @@ object PoemSaver {
      * 调用方随后逐段调用 [PoemWriter.appendParagraph]，最后调用 [PoemWriter.finish]。
      */
     fun openStream(context: Context, title: String?): Result<PoemWriter> {
-        val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+        // 带毫秒：API<29 走 File 写入，同一秒内两次生成会互相覆盖。
+        val ts = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.getDefault()).format(Date())
         val fileName = "poem_$ts.txt"
         return try {
             val out: OutputStream = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                openMediaStoreStream(context, fileName) ?: return Result.failure(
-                    Exception("MediaStore 创建文件失败")
-                )
+                openMediaStoreStream(context, fileName, title)
             } else {
-                openFileStream(fileName)
-            }
-            // 写入标题
-            title?.let {
-                out.write("《".toByteArray(Charsets.UTF_8))
-                out.write(it.toByteArray(Charsets.UTF_8))
-                out.write("》\n\n".toByteArray(Charsets.UTF_8))
+                openFileStream(fileName, title)
             }
             Result.success(PoemWriter(out, fileName))
         } catch (e: Exception) {
@@ -62,8 +55,21 @@ object PoemSaver {
         }
     }
 
+    /** 写入文件头部的标题（若有）。 */
+    private fun writeTitle(out: OutputStream, title: String?) {
+        title?.let {
+            out.write("《".toByteArray(Charsets.UTF_8))
+            out.write(it.toByteArray(Charsets.UTF_8))
+            out.write("》\n\n".toByteArray(Charsets.UTF_8))
+        }
+    }
+
     @RequiresApi(Build.VERSION_CODES.Q)
-    private fun openMediaStoreStream(context: Context, fileName: String): OutputStream? {
+    private fun openMediaStoreStream(
+        context: Context,
+        fileName: String,
+        title: String?,
+    ): OutputStream {
         val values = ContentValues().apply {
             put(MediaStore.Downloads.DISPLAY_NAME, fileName)
             put(MediaStore.Downloads.MIME_TYPE, "text/plain")
@@ -71,11 +77,20 @@ object PoemSaver {
         }
         val uri = context.contentResolver
             .insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-            ?: return null
-        return context.contentResolver.openOutputStream(uri)
+            ?: error("MediaStore 创建文件失败")
+        return try {
+            val out = context.contentResolver.openOutputStream(uri)
+                ?: error("MediaStore 打开输出流失败")
+            writeTitle(out, title)
+            out
+        } catch (e: Exception) {
+            // 打开流或写标题失败都要回滚，避免在公共目录留下空文件。
+            context.contentResolver.delete(uri, null, null)
+            throw e
+        }
     }
 
-    private fun openFileStream(fileName: String): OutputStream {
+    private fun openFileStream(fileName: String, title: String?): OutputStream {
         val dir = File(
             Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
             SUB_DIR,
@@ -83,7 +98,16 @@ object PoemSaver {
         if (!dir.exists() && !dir.mkdirs()) {
             throw Exception("无法创建目录：${dir.absolutePath}")
         }
-        return File(dir, fileName).outputStream()
+        val file = File(dir, fileName)
+        val out = file.outputStream()
+        try {
+            writeTitle(out, title)
+        } catch (e: Exception) {
+            runCatching { out.close() }
+            file.delete()
+            throw e
+        }
+        return out
     }
 }
 

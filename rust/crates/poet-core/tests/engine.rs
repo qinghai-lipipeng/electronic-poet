@@ -152,6 +152,133 @@ fn rhyme_lines_end_with_rhyme_words() {
     }
 }
 
+/// 句中出现与句尾同名的占位符时，只有句尾从韵库取词，句内仍从词库取词。
+#[test]
+fn repeated_slot_uses_lexicon_except_tail() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("pack1");
+    write(&root.join("manifest.conf"), "id = repeat\nname = 重复占位符\n");
+    write(&root.join("grammar/modern.txt"), "从MM到MM\n");
+    write(&root.join("lexicon/MM.txt"), "月亮\n灯塔\n荒原\n");
+    write(&root.join("rhyme/gu.txt"), "MM=旅途\nMM=归途\n");
+    let pack = Pack::load(&root).unwrap();
+
+    let opts = GenOptions {
+        paragraphs: 1,
+        lines_per_paragraph: 4,
+        rhyme: true,
+        rhyme_id: Some("gu".to_string()),
+        rhyme_scheme: RhymeScheme::Every,
+        per_paragraph_rhyme: false,
+        make_title: false,
+        seed: Some(3),
+        ..Default::default()
+    };
+    let poem = pack.generate(&opts).unwrap();
+    let stanza = &poem.paragraphs[0];
+    assert_eq!(stanza.len(), 4);
+    for line in stanza {
+        // "从MM到MM" → 从 + 词 + 到 + 词
+        let chars: Vec<char> = line.chars().collect();
+        assert_eq!(chars.len(), 6, "行长应为 6 字：{line}");
+        let inner: String = chars[1..3].iter().collect();
+        let tail: String = chars[4..6].iter().collect();
+        assert!(
+            ["月亮", "灯塔", "荒原"].contains(&inner.as_str()),
+            "句内占位符应取自词库：{line}"
+        );
+        assert!(
+            ["旅途", "归途"].contains(&tail.as_str()),
+            "句尾占位符应取自韵库：{line}"
+        );
+    }
+}
+
+/// 句中出现同名占位符且该代码没有词库时，模板不可押韵（否则句内会填出空词）。
+#[test]
+fn repeated_slot_without_lexicon_is_not_rhymable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("pack1");
+    write(&root.join("manifest.conf"), "id = repeat\nname = 重复占位符\n");
+    // MM 只有韵库没有词库；可用模板 XX的TT 的句尾 TT 不在韵库中。
+    write(&root.join("grammar/modern.txt"), "从MM到MM\nXX的TT\n");
+    write(&root.join("lexicon/XX.txt"), "温柔\n明亮\n遥远\n");
+    write(&root.join("lexicon/TT.txt"), "啊！\n噢！\n");
+    write(&root.join("rhyme/gu.txt"), "MM=旅途\nMM=归途\n");
+    let pack = Pack::load(&root).unwrap();
+
+    let opts = GenOptions {
+        paragraphs: 1,
+        lines_per_paragraph: 3,
+        rhyme: true,
+        rhyme_id: Some("gu".to_string()),
+        make_title: false,
+        seed: Some(5),
+        ..Default::default()
+    };
+    let poem = pack.generate(&opts).unwrap();
+    // 没有可用韵部 → 回退为不押韵并给出提示。
+    assert_eq!(poem.warnings.len(), 1, "应给出押韵回退提示：{:?}", poem.warnings);
+    for line in &poem.paragraphs[0] {
+        assert!(
+            !line.contains("旅途") && !line.contains("归途"),
+            "不可押韵的模板不应被选中：{line}"
+        );
+        assert!(line.contains('的'), "应使用可用模板 XX的TT：{line}");
+    }
+}
+
+/// 未指定种子时，返回的 seed 必须是本次实际使用的种子，可用于复现。
+#[test]
+fn unspecified_seed_is_reported_for_replay() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("pack1");
+    make_pack(&root, false);
+    let pack = Pack::load(&root).unwrap();
+
+    let opts = GenOptions {
+        paragraphs: 2,
+        lines_per_paragraph: 3,
+        make_title: true,
+        seed: None,
+        ..Default::default()
+    };
+    let poem = pack.generate(&opts).unwrap();
+    let replay = pack
+        .generate(&GenOptions {
+            seed: Some(poem.seed),
+            ..opts.clone()
+        })
+        .unwrap();
+    assert_eq!(poem.title, replay.title);
+    assert_eq!(poem.paragraphs, replay.paragraphs);
+    assert_eq!(poem.rhymes, replay.rhymes);
+}
+
+/// begin_generate 的 JSON 须为 camelCase 的 `title` / `seed`（Kotlin 侧按此解析）。
+#[test]
+fn begin_out_json_shape() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("pack1");
+    make_pack(&root, false);
+    let pack = Pack::load(&root).unwrap();
+
+    let opts = GenOptions {
+        paragraphs: 1,
+        lines_per_paragraph: 2,
+        make_title: true,
+        seed: Some(1234),
+        ..Default::default()
+    };
+    let begin = pack.begin_generate(&opts).unwrap();
+    assert_eq!(begin.seed, 1234);
+    assert!(begin.title.is_some());
+
+    let json = serde_json::to_value(&begin).unwrap();
+    assert_eq!(json["seed"].as_u64(), Some(1234));
+    assert!(json["title"].is_string(), "标题应序列化为 JSON 字符串：{json}");
+}
+
 #[test]
 fn alternate_scheme_rhymes_only_even_lines() {
     let tmp = tempfile::tempdir().unwrap();
@@ -223,6 +350,12 @@ fn lists_packs_under_mount_root() {
 
     let beta = packs.iter().find(|p| p.path.ends_with("beta")).unwrap();
     assert!(beta.rhymes.contains(&"ang".to_string()));
+
+    // JSON 键须为 camelCase：Kotlin 侧按 titleTemplates / lexiconWords / lexiconCodes 解析。
+    let json = serde_json::to_value(beta).unwrap();
+    for key in ["titleTemplates", "lexiconWords", "lexiconCodes"] {
+        assert!(json.get(key).is_some(), "缺少 camelCase 字段 {key}：{json}");
+    }
 }
 
 #[test]

@@ -65,7 +65,8 @@ class SettingsStore(private val context: Context) {
             p[Keys.PER_PARAGRAPH_RHYME] = params.perParagraphRhyme
             p[Keys.EVERY_LINE] = params.everyLine
             p[Keys.MAKE_TITLE] = params.makeTitle
-            params.seed?.let { p[Keys.SEED] = it }
+            // 种子留空 = 每次随机：必须清除旧值，否则下次启动会恢复上一次的种子。
+            if (params.seed == null) p.remove(Keys.SEED) else p[Keys.SEED] = params.seed
             p[Keys.SHOW_IN_UI] = params.showInUi
             p[Keys.MEMORY_LIMIT_PERCENT] = params.memoryLimitPercent.coerceIn(1, 100)
         }

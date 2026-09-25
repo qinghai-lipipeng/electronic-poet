@@ -155,17 +155,14 @@ pub extern "system" fn Java_com_otaku_poet_jni_NativePoet_nativeBeginGenerate(
             return std::ptr::null_mut();
         }
     };
-    let seed = options.seed.unwrap_or(0);
     match pack.begin_generate(&options) {
-        Ok(title) => {
-            let json = format!(
-                r#"{{"title":{},"seed":{}}}"#,
-                title.map(|t| format!("\"{}\"", t.replace('\\', "\\\\").replace('"', "\\\"")))
-                    .unwrap_or_else(|| "null".to_string()),
-                seed
-            );
-            output_string(&mut env, &json)
-        }
+        Ok(begin) => match serde_json::to_string(&begin) {
+            Ok(json) => output_string(&mut env, &json),
+            Err(e) => {
+                throw_new(&mut env, RUNTIME_EXCEPTION, format!("序列化生成信息失败：{e}"));
+                std::ptr::null_mut()
+            }
+        },
         Err(e) => {
             throw_new(&mut env, RUNTIME_EXCEPTION, e.to_string());
             std::ptr::null_mut()

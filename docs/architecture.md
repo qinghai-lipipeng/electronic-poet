@@ -61,14 +61,17 @@
 
 ## JNI 接口
 
-共五个静态方法。复杂参数与结果一律以 **JSON 字符串**传递，保持接口简单稳定：
+共八个静态方法。复杂参数与结果一律以 **JSON 字符串**传递，保持接口简单稳定：
 
 | Kotlin 方法 | 作用 | 返回 |
 |---|---|---|
 | `nativeVersion()` | 引擎版本号 | `String` |
 | `nativeListPacks(root)` | 扫描挂载根目录，列出所有词库包 | JSON 数组（PackSummary） |
 | `nativeOpen(dir)` | 打开一个词库包 | 句柄 `long` |
-| `nativeGenerate(handle, optsJson)` | 按参数生成诗作 | JSON 对象（PoemOut） |
+| `nativeGenerate(handle, optsJson)` | 按参数一次性生成诗作 | JSON 对象（PoemOut） |
+| `nativeBeginGenerate(handle, optsJson)` | 开始流式生成 | JSON 对象（`title`、`seed`） |
+| `nativeNextParagraph(handle)` | 取下一段 | JSON 对象（`lines`、`rhyme`）或 `{"done":true}` |
+| `nativeEndGenerate(handle)` | 结束流式生成 | JSON 数组（warnings） |
 | `nativeClose(handle)` | 关闭词库包，释放资源 | — |
 
 生成参数 JSON 字段（对应 `GenOptions`，camelCase，均有默认值）：
@@ -87,7 +90,7 @@
 ```
 
 - `rhymeScheme`：`"every"` 行行押，`"alternate"` 隔行押；
-- `seed` 为 null 时引擎随机；给定数字则结果可复现。
+- `seed` 为 null 时引擎随机，实际使用的种子会随结果返回（`PoemOut.seed` / `BeginOut.seed`）；给定数字则结果可复现。
 
 ## 生成流程
 

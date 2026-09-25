@@ -6,7 +6,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::pack::{Pack, Template, WeightedVec};
+use crate::pack::{Pack, Template, Token, WeightedVec};
 
 /// 流式生成会话：保存 begin → next → end 之间的状态。
 #[derive(Debug)]
@@ -30,6 +30,15 @@ pub struct GenerateSession {
 pub struct ParagraphOut {
     pub lines: Vec<String>,
     pub rhyme: Option<String>,
+}
+
+/// 流式生成开始时的返回（begin_generate）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BeginOut {
+    pub title: Option<String>,
+    /// 本次实际使用的随机种子：未指定种子时由引擎随机生成，可用于复现同一首诗。
+    pub seed: u64,
 }
 
 /// 押韵排布方式。
@@ -66,7 +75,7 @@ pub struct GenOptions {
     pub rhyme_scheme: RhymeScheme,
     /// 是否生成标题。
     pub make_title: bool,
-    /// 随机种子；None 表示由上层播种后回填。
+    /// 随机种子；None 表示由引擎随机生成，实际使用的种子会随生成结果返回。
     pub seed: Option<u64>,
 }
 
@@ -150,9 +159,9 @@ impl Rng {
 }
 
 impl Pack {
-    /// 开始一次流式生成会话，返回生成的标题（若开启）。
+    /// 开始一次流式生成会话，返回标题（若开启）与本次实际使用的种子。
     /// 之后反复调用 [`Pack::next_paragraph`] 获取每一段，最后调用 [`Pack::end_generate`]。
-    pub fn begin_generate(&self, options: &GenOptions) -> crate::pack::Result<Option<String>> {
+    pub fn begin_generate(&self, options: &GenOptions) -> crate::pack::Result<BeginOut> {
         let seed = options.seed.unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -239,7 +248,7 @@ impl Pack {
             warnings,
         };
         *self.session.lock().unwrap() = Some(session);
-        Ok(title)
+        Ok(BeginOut { title, seed })
     }
 
     /// 生成下一段。返回 `None` 表示全部段落已生成完毕。
@@ -333,7 +342,7 @@ impl Pack {
 
     /// 按参数生成一首现代诗（一次性，内部调用流式接口）。
     pub fn generate(&self, options: &GenOptions) -> crate::pack::Result<PoemOut> {
-        let title = self.begin_generate(options)?;
+        let begin = self.begin_generate(options)?;
         let mut paragraphs: Vec<Vec<String>> = Vec::new();
         let mut rhymes: Vec<Option<String>> = Vec::new();
         while let Some(p) = self.next_paragraph()? {
@@ -341,13 +350,12 @@ impl Pack {
             paragraphs.push(p.lines);
         }
         let warnings = self.end_generate();
-        let seed = options.seed.unwrap_or(0);
         Ok(PoemOut {
-            title,
+            title: begin.title,
             paragraphs,
             pack_id: self.manifest.id.clone(),
             pack_name: self.manifest.name.clone(),
-            seed,
+            seed: begin.seed,
             rhymes,
             warnings,
         })
@@ -362,16 +370,22 @@ impl Pack {
         rhyme_id: Option<&str>,
         rhyme_line: bool,
     ) -> String {
-        let tail = tpl.tail_slot().map(|s| s.to_string());
+        // 押韵位置是模板的最后一个占位符（句尾）；句中出现同名占位符时，
+        // 仍从词库取词，不能一并当作韵脚。
+        let tail_idx = tpl
+            .tokens
+            .len()
+            .checked_sub(1)
+            .filter(|&i| matches!(tpl.tokens[i], Token::Slot(_)));
         // 记录本次填充中已用过的 (code, word)，降低同句重复。
         let mut used: HashSet<(String, String)> = HashSet::new();
         let mut out = String::new();
 
-        for token in &tpl.tokens {
+        for (idx, token) in tpl.tokens.iter().enumerate() {
             match token {
-                crate::pack::Token::Literal(s) => out.push_str(s),
-                crate::pack::Token::Slot(code) => {
-                    let is_tail = tail.as_deref() == Some(code.as_str());
+                Token::Literal(s) => out.push_str(s),
+                Token::Slot(code) => {
+                    let is_tail = tail_idx == Some(idx);
                     let word = if rhyme_line && is_tail {
                         if let Some(rid) = rhyme_id {
                             let rhyme_words = self

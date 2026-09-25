@@ -9,7 +9,7 @@ import android.os.Process
  */
 object MemoryGuard {
 
-    /** 每生成多少段检查一次内存（避免每段都调用 getProcessMemoryInfo 的开销）。 */
+    /** 生成时检查内存的最小间隔（段）：短文按此间隔检查，长文由调用方稀疏化。 */
     const val CHECK_INTERVAL = 10
 
     /** 设备当前可用内存（字节）。 */

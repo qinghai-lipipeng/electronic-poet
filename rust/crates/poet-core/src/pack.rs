@@ -89,6 +89,7 @@ pub struct Pack {
 
 /// 包摘要（用于列表展示，无需完整加载）。
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PackSummary {
     pub id: String,
     pub name: String,
@@ -380,6 +381,7 @@ impl Pack {
 
     /// 判断模板在指定韵部下能否作为押韵行：句尾为占位符，
     /// 且韵库中该占位符有词，其余占位符词库非空。
+    /// 注意仅**最后一个**占位符可由韵库提供：句中出现同名占位符时仍要求词库非空。
     pub fn is_rhymable(&self, tpl: &Template, rhyme_id: &str) -> bool {
         let tail = match tpl.tail_slot() {
             Some(c) => c,
@@ -394,12 +396,19 @@ impl Pack {
         if !rhyme_ok {
             return false;
         }
-        tpl.slot_codes().all(|c| {
-            if c == tail {
-                true // 尾词由韵库提供
-            } else {
-                self.lexicon.get(c).map(|v| !v.is_empty()).unwrap_or(false)
+        let last = tpl.tokens.len() - 1;
+        tpl.tokens.iter().enumerate().all(|(i, t)| match t {
+            Token::Slot(c) => {
+                if i == last {
+                    true // 尾词由韵库提供
+                } else {
+                    self.lexicon
+                        .get(c.as_str())
+                        .map(|v| !v.is_empty())
+                        .unwrap_or(false)
+                }
             }
+            Token::Literal(_) => true,
         })
     }
 

@@ -14,7 +14,7 @@ pub mod pack;
 
 mod ffi;
 
-pub use generator::{GenOptions, PoemOut, RhymeScheme};
+pub use generator::{BeginOut, GenOptions, PoemOut, RhymeScheme};
 pub use pack::{list_packs, Manifest, Pack, PackSummary, PoetError, Result, Template, Token};
 
 /// 引擎版本（来自 Cargo.toml）。
