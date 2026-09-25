@@ -132,6 +132,96 @@ pub extern "system" fn Java_com_otaku_poet_jni_NativePoet_nativeGenerate(
     }
 }
 
+/// 开始流式生成，返回 JSON `{"title":...,"seed":...}`。
+#[no_mangle]
+pub extern "system" fn Java_com_otaku_poet_jni_NativePoet_nativeBeginGenerate(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    opts_json: JString,
+) -> jstring {
+    if handle == 0 {
+        throw_new(&mut env, RUNTIME_EXCEPTION, "词库引擎尚未打开（句柄为空）");
+        return std::ptr::null_mut();
+    }
+    let pack = unsafe { &*(handle as *const Pack) };
+    let Some(opts_str) = input_string(&mut env, &opts_json) else {
+        return std::ptr::null_mut();
+    };
+    let options: GenOptions = match serde_json::from_str(&opts_str) {
+        Ok(o) => o,
+        Err(e) => {
+            throw_new(&mut env, ILLEGAL_ARGUMENT, format!("生成参数解析失败：{e}"));
+            return std::ptr::null_mut();
+        }
+    };
+    let seed = options.seed.unwrap_or(0);
+    match pack.begin_generate(&options) {
+        Ok(title) => {
+            let json = format!(
+                r#"{{"title":{},"seed":{}}}"#,
+                title.map(|t| format!("\"{}\"", t.replace('\\', "\\\\").replace('"', "\\\"")))
+                    .unwrap_or_else(|| "null".to_string()),
+                seed
+            );
+            output_string(&mut env, &json)
+        }
+        Err(e) => {
+            throw_new(&mut env, RUNTIME_EXCEPTION, e.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// 生成下一段，返回 JSON `{"lines":[...],"rhyme":...}` 或 `{"done":true}`。
+#[no_mangle]
+pub extern "system" fn Java_com_otaku_poet_jni_NativePoet_nativeNextParagraph(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jstring {
+    if handle == 0 {
+        throw_new(&mut env, RUNTIME_EXCEPTION, "词库引擎尚未打开（句柄为空）");
+        return std::ptr::null_mut();
+    }
+    let pack = unsafe { &*(handle as *const Pack) };
+    match pack.next_paragraph() {
+        Ok(Some(p)) => match serde_json::to_string(&p) {
+            Ok(json) => output_string(&mut env, &json),
+            Err(e) => {
+                throw_new(&mut env, RUNTIME_EXCEPTION, format!("序列化段落失败：{e}"));
+                std::ptr::null_mut()
+            }
+        },
+        Ok(None) => output_string(&mut env, r#"{"done":true}"#),
+        Err(e) => {
+            throw_new(&mut env, RUNTIME_EXCEPTION, e.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// 结束流式生成，返回 warnings 的 JSON 数组。
+#[no_mangle]
+pub extern "system" fn Java_com_otaku_poet_jni_NativePoet_nativeEndGenerate(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jstring {
+    if handle == 0 {
+        return output_string(&mut env, "[]");
+    }
+    let pack = unsafe { &*(handle as *const Pack) };
+    let warnings = pack.end_generate();
+    match serde_json::to_string(&warnings) {
+        Ok(json) => output_string(&mut env, &json),
+        Err(e) => {
+            throw_new(&mut env, RUNTIME_EXCEPTION, format!("序列化警告失败：{e}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// 关闭并释放词库包句柄。
 #[no_mangle]
 pub extern "system" fn Java_com_otaku_poet_jni_NativePoet_nativeClose(

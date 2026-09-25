@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// 模板中的一个片段。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,7 +73,7 @@ pub struct Manifest {
 pub type WeightedVec = Vec<(String, u32)>;
 
 /// 一个已加载的语言资源包。
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Pack {
     pub root: PathBuf,
     pub manifest: Manifest,
@@ -82,6 +83,8 @@ pub struct Pack {
     pub lexicon: HashMap<String, WeightedVec>,
     /// 韵部 id -> (code -> 词表)
     pub rhymes: HashMap<String, HashMap<String, Vec<String>>>,
+    /// 流式生成会话状态（begin/next/end）。
+    pub(crate) session: Arc<Mutex<Option<crate::generator::GenerateSession>>>,
 }
 
 /// 包摘要（用于列表展示，无需完整加载）。
@@ -106,6 +109,7 @@ pub enum PoetError {
     Io(String, std::io::Error),
     Parse(String),
     Empty(String),
+    InvalidState(String),
 }
 
 impl fmt::Display for PoetError {
@@ -114,6 +118,7 @@ impl fmt::Display for PoetError {
             PoetError::Io(p, e) => write!(f, "读取 `{p}` 失败：{e}"),
             PoetError::Parse(m) => write!(f, "解析失败：{m}"),
             PoetError::Empty(m) => write!(f, "{m}"),
+            PoetError::InvalidState(m) => write!(f, "状态错误：{m}"),
         }
     }
 }
@@ -355,6 +360,7 @@ impl Pack {
             title_templates,
             lexicon,
             rhymes,
+            session: Arc::new(Mutex::new(None)),
         })
     }
 

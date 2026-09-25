@@ -22,6 +22,10 @@ data class UiState(
     val poem: PoemResult? = null,
     val busy: Boolean = false,
     val message: String? = null,
+    /** 生成进度：已生成的段落数（仅在 showInUi=false 时用于显示进度）。 */
+    val generatingProgress: Int = 0,
+    /** 生成总段落数（用于进度显示）。 */
+    val generatingTotal: Int = 0,
 )
 
 class PoetViewModel(app: Application) : AndroidViewModel(app) {
@@ -83,37 +87,165 @@ class PoetViewModel(app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(params = transform(it.params)) }
     }
 
-    /** 生成一首诗。 */
+    /**
+     * 生成一首诗（流式：边生成边写入文件）。
+     *
+     * - showInUi=true：逐段在 UI 显示（内存会随段落增长，适合短诗）；
+     * - showInUi=false（默认）：不在 UI 累积文本，仅写文件、显示进度数字，
+     *   可支持超长篇幅而不 OOM。
+     * 内存占用超过用户设定的可用内存百分比时自动停止，保留已生成部分。
+     */
     fun generate() {
         if (handle == 0L) {
             _state.update { it.copy(message = "尚未挂载词库包，请先在“词库管理”中导入") }
             return
         }
         viewModelScope.launch {
-            _state.update { it.copy(busy = true) }
             val current = _state.value.params
-            // 保证正数（Rust 端为 u64）。
             val seed = current.seed ?: (random.nextLong() ushr 1)
             val params = current.copy(seed = seed)
-            try {
-                val json = NativePoet.generate(handle, params.toJson())
-                val poem = PoemResult.fromJson(JSONObject(json))
-                settings.saveParams(params)
-                // 每次生成自动写入 /sdcard/Download/cyberpoet/*.txt
-                val saveMsg = PoemSaver.save(getApplication(), poem).fold(
-                    onSuccess = { "已保存：Download/cyberpoet/$it" },
-                    onFailure = { "保存失败：${it.message}" },
+            val ctx = getApplication<Application>()
+            val showInUi = params.showInUi
+
+            _state.update {
+                it.copy(
+                    busy = true,
+                    poem = null,
+                    generatingProgress = 0,
+                    generatingTotal = params.paragraphs,
                 )
+            }
+
+            var writer: PoemWriter? = null
+            var memoryStopped = false
+            try {
+                // 1. 开始流式生成，获取标题
+                val beginJson = JSONObject(NativePoet.beginGenerate(handle, params.toJson()))
+                val title = if (beginJson.isNull("title")) null
+                else beginJson.optString("title").ifEmpty { null }
+                val actualSeed = beginJson.optLong("seed", seed)
+
+                // 2. 打开流式写入器（边生成边写文件）
+                writer = PoemSaver.openStream(ctx, title).getOrThrow()
+
+                // 仅在 showInUi 时才累积段落文本
+                val paragraphs = if (showInUi) mutableListOf<List<String>>() else null
+                val rhymes = if (showInUi) mutableListOf<String?>() else null
+                val activePack = _state.value.active
+
+                // UI 更新间隔：总段数越多间隔越大，目标总共更新约 200 次，
+                // 避免千万次级 StateFlow 更新导致主线程阻塞 / OOM。
+                val uiUpdateInterval = maxOf(1, params.paragraphs / 200)
+                // 内存检查间隔：至少每 100 段，大篇幅时更稀疏。
+                val memCheckInterval = maxOf(100, params.paragraphs / 1000)
+
+                // 3. 逐段生成
+                var index = 0
+                while (true) {
+                    val nextJson = JSONObject(NativePoet.nextParagraph(handle))
+                    if (nextJson.optBoolean("done", false)) break
+
+                    val linesArr = nextJson.optJSONArray("lines") ?: break
+                    val lines = List(linesArr.length()) { linesArr.getString(it) }
+                    val rhyme = if (nextJson.isNull("rhyme")) null
+                    else nextJson.optString("rhyme").ifEmpty { null }
+
+                    // 立即写入文件（无论是否显示）
+                    writer.appendParagraph(lines)
+
+                    index++
+
+                    // 按间隔更新 UI，避免高频重组
+                    if (index % uiUpdateInterval == 0 || index == params.paragraphs) {
+                        if (showInUi) {
+                            paragraphs!!.add(lines)
+                            rhymes!!.add(rhyme)
+                            val partial = PoemResult(
+                                title = title,
+                                paragraphs = paragraphs.toList(),
+                                packId = activePack?.id ?: "",
+                                packName = activePack?.name ?: "",
+                                seed = actualSeed,
+                                rhymes = rhymes.toList(),
+                                warnings = emptyList(),
+                            )
+                            _state.update { it.copy(poem = partial, generatingProgress = index) }
+                        } else {
+                            _state.update { it.copy(generatingProgress = index) }
+                        }
+                    } else if (showInUi) {
+                        // 非更新点也要累积数据，下次更新时一并提交
+                        paragraphs!!.add(lines)
+                        rhymes!!.add(rhyme)
+                    }
+
+                    // 内存检查
+                    if (index % memCheckInterval == 0 &&
+                        MemoryGuard.isOverLimit(ctx, params.memoryLimitPercent)
+                    ) {
+                        memoryStopped = true
+                        break
+                    }
+                }
+
+                // 4. 结束生成，获取 warnings
+                val warningsArr = org.json.JSONArray(NativePoet.endGenerate(handle))
+                val warnings = List(warningsArr.length()) { warningsArr.getString(it) }
+
+                settings.saveParams(params)
+
+                // 5. 完成写入（元信息 + 关闭流）
+                writer.finish(activePack?.name ?: "", actualSeed)
+
+                val saveMsg = "已保存：Download/cyberpoet/${writer.fileName}（共 $index 段）"
+                val stopMsg = if (memoryStopped)
+                    "内存达到上限（可用内存${params.memoryLimitPercent}%），已停止，已生成 $index 段并保存"
+                else null
+
+                if (showInUi) {
+                    val finalPoem = PoemResult(
+                        title = title,
+                        paragraphs = paragraphs!!.toList(),
+                        packId = activePack?.id ?: "",
+                        packName = activePack?.name ?: "",
+                        seed = actualSeed,
+                        rhymes = rhymes!!.toList(),
+                        warnings = warnings,
+                    )
+                    _state.update {
+                        it.copy(
+                            busy = false,
+                            params = params,
+                            poem = finalPoem,
+                            generatingProgress = 0,
+                            generatingTotal = 0,
+                            message = stopMsg ?: warnings.firstOrNull() ?: saveMsg,
+                        )
+                    }
+                } else {
+                    // 不显示内容，poem 保持 null，仅通过 message 告知结果
+                    _state.update {
+                        it.copy(
+                            busy = false,
+                            params = params,
+                            poem = null,
+                            generatingProgress = 0,
+                            generatingTotal = 0,
+                            message = stopMsg ?: warnings.firstOrNull() ?: saveMsg,
+                        )
+                    }
+                }
+            } catch (e: Throwable) {
+                writer?.abort()
+                runCatching { NativePoet.endGenerate(handle) }
                 _state.update {
                     it.copy(
                         busy = false,
-                        params = params,
-                        poem = poem,
-                        message = poem.warnings.firstOrNull() ?: saveMsg,
+                        generatingProgress = 0,
+                        generatingTotal = 0,
+                        message = "生成失败：${e.message}",
                     )
                 }
-            } catch (e: Throwable) {
-                _state.update { it.copy(busy = false, message = "生成失败：${e.message}") }
             }
         }
     }

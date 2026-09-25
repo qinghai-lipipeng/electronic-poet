@@ -7,13 +7,18 @@ import android.os.Environment
 import android.provider.MediaStore
 import androidx.annotation.RequiresApi
 import java.io.File
+import java.io.OutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 /**
- * 每次生成后自动把诗作以 txt 写入公共下载目录的 cyberpoet 子目录：
+ * 把诗作以 txt 写入公共下载目录的 cyberpoet 子目录：
  *   /sdcard/Download/cyberpoet/poem_yyyyMMdd_HHmmss.txt
+ *
+ * 支持两种模式：
+ * - [save]：一次性写入整首诗（兼容旧接口）；
+ * - [openStream]：返回 [PoemWriter]，边生成边逐段写入（流式，内存占用低）。
  *
  * API 29+ 用 MediaStore（无需存储权限）；
  * API 26-28 用传统 File（需 WRITE_EXTERNAL_STORAGE，已在 Manifest 声明 maxSdkVersion=28）。
@@ -22,31 +27,43 @@ object PoemSaver {
 
     private const val SUB_DIR = "cyberpoet"
 
+    /** 一次性保存整首诗（兼容接口）。 */
     fun save(context: Context, poem: PoemResult): Result<String> {
+        val writer = openStream(context, poem.title).getOrElse { return Result.failure(it) }
+        poem.paragraphs.forEach { writer.appendParagraph(it) }
+        writer.finish(poem.packName, poem.seed)
+        return Result.success(writer.fileName)
+    }
+
+    /**
+     * 打开一个流式写入器，返回 [PoemWriter]。
+     * 调用方随后逐段调用 [PoemWriter.appendParagraph]，最后调用 [PoemWriter.finish]。
+     */
+    fun openStream(context: Context, title: String?): Result<PoemWriter> {
         val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
         val fileName = "poem_$ts.txt"
-        // fullText 已保证段与段之间以空行分隔；末尾用分隔线标注元信息。
-        val content = buildString {
-            append(poem.fullText)
-            append("\n————————————————\n")
-            append("词库：${poem.packName}\n")
-            append("种子：${poem.seed}\n")
-            append("时间：${SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())}\n")
-        }
         return try {
-            val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                saveViaMediaStore(context, fileName, content)
+            val out: OutputStream = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                openMediaStoreStream(context, fileName) ?: return Result.failure(
+                    Exception("MediaStore 创建文件失败")
+                )
             } else {
-                saveViaFile(fileName, content)
+                openFileStream(fileName)
             }
-            if (ok) Result.success(fileName) else Result.failure(Exception("写入返回失败"))
+            // 写入标题
+            title?.let {
+                out.write("《".toByteArray(Charsets.UTF_8))
+                out.write(it.toByteArray(Charsets.UTF_8))
+                out.write("》\n\n".toByteArray(Charsets.UTF_8))
+            }
+            Result.success(PoemWriter(out, fileName))
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)
-    private fun saveViaMediaStore(context: Context, fileName: String, content: String): Boolean {
+    private fun openMediaStoreStream(context: Context, fileName: String): OutputStream? {
         val values = ContentValues().apply {
             put(MediaStore.Downloads.DISPLAY_NAME, fileName)
             put(MediaStore.Downloads.MIME_TYPE, "text/plain")
@@ -54,21 +71,66 @@ object PoemSaver {
         }
         val uri = context.contentResolver
             .insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-            ?: return false
-        context.contentResolver.openOutputStream(uri)?.use {
-            it.write(content.toByteArray(Charsets.UTF_8))
-        } ?: return false
-        return true
+            ?: return null
+        return context.contentResolver.openOutputStream(uri)
     }
 
-    private fun saveViaFile(fileName: String, content: String): Boolean {
+    private fun openFileStream(fileName: String): OutputStream {
         val dir = File(
             Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
             SUB_DIR,
         )
-        if (!dir.exists() && !dir.mkdirs()) return false
-        val file = File(dir, fileName)
-        file.writeText(content, Charsets.UTF_8)
-        return true
+        if (!dir.exists() && !dir.mkdirs()) {
+            throw Exception("无法创建目录：${dir.absolutePath}")
+        }
+        return File(dir, fileName).outputStream()
+    }
+}
+
+/**
+ * 流式诗作写入器：边生成边写入，每段立即 flush，内存中不累积全诗。
+ */
+class PoemWriter(
+    private val out: OutputStream,
+    val fileName: String,
+) {
+    private var firstParagraph = true
+    private var closed = false
+
+    /** 追加一段文本，段与段之间以空行分隔。 */
+    fun appendParagraph(lines: List<String>) {
+        if (closed) return
+        if (!firstParagraph) {
+            out.write("\n".toByteArray(Charsets.UTF_8)) // 段前空一行
+        }
+        firstParagraph = false
+        for (line in lines) {
+            out.write(line.toByteArray(Charsets.UTF_8))
+            out.write("\n".toByteArray(Charsets.UTF_8))
+        }
+        out.flush()
+    }
+
+    /** 写入元信息并关闭流。 */
+    fun finish(packName: String, seed: Long) {
+        if (closed) return
+        closed = true
+        out.write("\n————————————————\n".toByteArray(Charsets.UTF_8))
+        out.write("词库：$packName\n".toByteArray(Charsets.UTF_8))
+        out.write("种子：$seed\n".toByteArray(Charsets.UTF_8))
+        out.write(
+            "时间：${
+                SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
+            }\n".toByteArray(Charsets.UTF_8)
+        )
+        out.flush()
+        out.close()
+    }
+
+    /** 异常中止时关闭流（不写元信息）。 */
+    fun abort() {
+        if (closed) return
+        closed = true
+        runCatching { out.close() }
     }
 }

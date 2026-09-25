@@ -8,6 +8,30 @@ use serde::{Deserialize, Serialize};
 
 use crate::pack::{Pack, Template, WeightedVec};
 
+/// 流式生成会话：保存 begin → next → end 之间的状态。
+#[derive(Debug)]
+pub struct GenerateSession {
+    pub(crate) rng: Rng,
+    pub(crate) options: GenOptions,
+    pub(crate) current_rhyme: Option<String>,
+    /// 已使用过的韵部（HashSet，避免每段 push 导致内存随段落数线性增长）。
+    pub(crate) used_rhymes: HashSet<String>,
+    /// 缓存的可用韵部列表（begin 时计算一次，next 中直接复用）。
+    pub(crate) available_rhymes: Vec<String>,
+    pub(crate) current: usize,
+    pub(crate) total: usize,
+    pub(crate) title: Option<String>,
+    pub(crate) warnings: Vec<String>,
+}
+
+/// 单段输出（流式 next_paragraph 返回）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParagraphOut {
+    pub lines: Vec<String>,
+    pub rhyme: Option<String>,
+}
+
 /// 押韵排布方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -126,13 +150,9 @@ impl Rng {
 }
 
 impl Pack {
-    /// 按参数生成一首现代诗。
-    pub fn generate(&self, options: &GenOptions) -> crate::pack::Result<PoemOut> {
-        let paragraphs = options.paragraphs.clamp(1, 50);
-        let lines = options.lines_per_paragraph.clamp(1, 200);
-
-        // 种子：上层未给则用固定基准 + 系统时间无关的确定性兜底；
-        // 实际安卓端总是会传入随机种子。
+    /// 开始一次流式生成会话，返回生成的标题（若开启）。
+    /// 之后反复调用 [`Pack::next_paragraph`] 获取每一段，最后调用 [`Pack::end_generate`]。
+    pub fn begin_generate(&self, options: &GenOptions) -> crate::pack::Result<Option<String>> {
         let seed = options.seed.unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -142,7 +162,6 @@ impl Pack {
         let mut rng = Rng::new(seed);
         let mut warnings = Vec::new();
 
-        // 预先按可用性分组模板。
         let usable: Vec<&Template> = self
             .templates
             .iter()
@@ -154,13 +173,11 @@ impl Pack {
             ));
         }
 
-        // 确定候选韵部。
         let available_rhymes: Vec<String> = if options.rhyme {
             let mut v: Vec<String> = self
                 .rhymes
                 .keys()
                 .filter(|rid| {
-                    // 至少存在一个以该韵部可押韵的模板。
                     self.templates
                         .iter()
                         .any(|t| self.is_rhymable(t, rid.as_str()))
@@ -176,8 +193,7 @@ impl Pack {
             warnings.push("已开启押韵，但当前词库包没有可用韵部，本次不押韵".to_string());
         }
 
-        // 初始韵部。
-        let mut current_rhyme: Option<String> = if options.rhyme && !available_rhymes.is_empty() {
+        let current_rhyme: Option<String> = if options.rhyme && !available_rhymes.is_empty() {
             match &options.rhyme_id {
                 Some(rid) if available_rhymes.contains(rid) => Some(rid.clone()),
                 Some(_) => {
@@ -189,69 +205,11 @@ impl Pack {
         } else {
             None
         };
-
-        let mut out_paragraphs: Vec<Vec<String>> = Vec::new();
-        let mut out_rhymes: Vec<Option<String>> = Vec::new();
-        let mut used_rhymes: Vec<String> = Vec::new();
+        let mut used_rhymes: HashSet<String> = HashSet::new();
         if let Some(r) = &current_rhyme {
-            used_rhymes.push(r.clone());
+            used_rhymes.insert(r.clone());
         }
 
-        for p in 0..paragraphs {
-            if p > 0
-                && options.rhyme
-                && options.per_paragraph_rhyme
-                && !available_rhymes.is_empty()
-            {
-                // 每段换韵：尽量选一个尚未使用过的韵部。
-                let mut candidate = rng.pick(&available_rhymes).clone();
-                if available_rhymes.len() > used_rhymes.len() {
-                    let mut guard = 0;
-                    while used_rhymes.contains(&candidate) && guard < 20 {
-                        candidate = rng.pick(&available_rhymes).clone();
-                        guard += 1;
-                    }
-                }
-                used_rhymes.push(candidate.clone());
-                current_rhyme = Some(candidate);
-            }
-
-            let mut stanza: Vec<String> = Vec::new();
-            for line_idx in 0..lines {
-                let is_rhyme_line = current_rhyme.is_some() && match options.rhyme_scheme {
-                    RhymeScheme::Every => true,
-                    RhymeScheme::Alternate => line_idx % 2 == 1,
-                };
-
-                let line = if is_rhyme_line {
-                    let rid = current_rhyme.as_deref().unwrap();
-                    let rhymable: Vec<&Template> = self
-                        .templates
-                        .iter()
-                        .filter(|t| self.is_rhymable(t, rid))
-                        .collect();
-                    if rhymable.is_empty() {
-                        // 韵库无法匹配任何模板尾词，退化为普通行。
-                        let weighted = to_weighted(&usable);
-                        let tpl = rng.weighted(&weighted);
-                        self.fill(&mut rng, tpl, None, false)
-                    } else {
-                        let weighted = to_weighted(&rhymable);
-                        let tpl = rng.weighted(&weighted);
-                        self.fill(&mut rng, tpl, Some(rid), true)
-                    }
-                } else {
-                    let weighted = to_weighted(&usable);
-                    let tpl = rng.weighted(&weighted);
-                    self.fill(&mut rng, tpl, None, false)
-                };
-                stanza.push(line);
-            }
-            out_paragraphs.push(stanza);
-            out_rhymes.push(current_rhyme.clone());
-        }
-
-        // 标题。
         let title = if options.make_title {
             let usable_titles: Vec<&Template> = self
                 .title_templates
@@ -269,13 +227,128 @@ impl Pack {
             None
         };
 
+        let session = GenerateSession {
+            rng,
+            options: options.clone(),
+            current_rhyme,
+            used_rhymes,
+            available_rhymes,
+            current: 0,
+            total: options.paragraphs.max(1),
+            title: title.clone(),
+            warnings,
+        };
+        *self.session.lock().unwrap() = Some(session);
+        Ok(title)
+    }
+
+    /// 生成下一段。返回 `None` 表示全部段落已生成完毕。
+    pub fn next_paragraph(&self) -> crate::pack::Result<Option<ParagraphOut>> {
+        let mut guard = self.session.lock().unwrap();
+        let s = match guard.as_mut() {
+            Some(s) => s,
+            None => {
+                return Err(crate::pack::PoetError::InvalidState(
+                    "未调用 begin_generate".to_string(),
+                ))
+            }
+        };
+        if s.current >= s.total {
+            return Ok(None);
+        }
+
+        let options = &s.options;
+        let usable: Vec<&Template> = self
+            .templates
+            .iter()
+            .filter(|t| self.is_usable(t))
+            .collect();
+        // 直接复用 begin 时缓存的可用韵部列表，不再每段重算。
+        let available_rhymes = &s.available_rhymes;
+
+        if s.current > 0
+            && options.rhyme
+            && options.per_paragraph_rhyme
+            && !available_rhymes.is_empty()
+        {
+            let mut candidate = s.rng.pick(available_rhymes).clone();
+            if available_rhymes.len() > s.used_rhymes.len() {
+                let mut g = 0;
+                while s.used_rhymes.contains(&candidate) && g < 20 {
+                    candidate = s.rng.pick(available_rhymes).clone();
+                    g += 1;
+                }
+            }
+            s.used_rhymes.insert(candidate.clone());
+            s.current_rhyme = Some(candidate);
+        }
+
+        let lines = options.lines_per_paragraph.max(1);
+        let mut stanza: Vec<String> = Vec::with_capacity(lines);
+        for line_idx in 0..lines {
+            let is_rhyme_line = s.current_rhyme.is_some()
+                && match options.rhyme_scheme {
+                    RhymeScheme::Every => true,
+                    RhymeScheme::Alternate => line_idx % 2 == 1,
+                };
+
+            let line = if is_rhyme_line {
+                let rid = s.current_rhyme.as_deref().unwrap();
+                let rhymable: Vec<&Template> = self
+                    .templates
+                    .iter()
+                    .filter(|t| self.is_rhymable(t, rid))
+                    .collect();
+                if rhymable.is_empty() {
+                    let weighted = to_weighted(&usable);
+                    let tpl = s.rng.weighted(&weighted);
+                    self.fill(&mut s.rng, tpl, None, false)
+                } else {
+                    let weighted = to_weighted(&rhymable);
+                    let tpl = s.rng.weighted(&weighted);
+                    self.fill(&mut s.rng, tpl, Some(rid), true)
+                }
+            } else {
+                let weighted = to_weighted(&usable);
+                let tpl = s.rng.weighted(&weighted);
+                self.fill(&mut s.rng, tpl, None, false)
+            };
+            stanza.push(line);
+        }
+
+        let rhyme = s.current_rhyme.clone();
+        s.current += 1;
+        Ok(Some(ParagraphOut { lines: stanza, rhyme }))
+    }
+
+    /// 结束流式生成会话，返回累积的 warnings。
+    pub fn end_generate(&self) -> Vec<String> {
+        self.session
+            .lock()
+            .unwrap()
+            .take()
+            .map(|s| s.warnings)
+            .unwrap_or_default()
+    }
+
+    /// 按参数生成一首现代诗（一次性，内部调用流式接口）。
+    pub fn generate(&self, options: &GenOptions) -> crate::pack::Result<PoemOut> {
+        let title = self.begin_generate(options)?;
+        let mut paragraphs: Vec<Vec<String>> = Vec::new();
+        let mut rhymes: Vec<Option<String>> = Vec::new();
+        while let Some(p) = self.next_paragraph()? {
+            rhymes.push(p.rhyme);
+            paragraphs.push(p.lines);
+        }
+        let warnings = self.end_generate();
+        let seed = options.seed.unwrap_or(0);
         Ok(PoemOut {
             title,
-            paragraphs: out_paragraphs,
+            paragraphs,
             pack_id: self.manifest.id.clone(),
             pack_name: self.manifest.name.clone(),
             seed,
-            rhymes: out_rhymes,
+            rhymes,
             warnings,
         })
     }

@@ -83,7 +83,7 @@ data class PoemResult(
     }
 }
 
-/** 生成参数（对应 Rust 端 GenOptions）。 */
+/** 生成参数（对应 Rust 端 GenOptions，外加纯客户端设置）。 */
 data class GenParams(
     val paragraphs: Int = 3,
     val linesPerParagraph: Int = 4,
@@ -93,6 +93,10 @@ data class GenParams(
     val everyLine: Boolean = true,
     val makeTitle: Boolean = true,
     val seed: Long? = null,
+    /** 纯客户端：是否在 UI 界面逐段显示生成内容。关闭时仅写文件、不累积文本，避免大篇幅 OOM。 */
+    val showInUi: Boolean = false,
+    /** 纯客户端：内存上限占设备可用内存的百分比（1-100）。 */
+    val memoryLimitPercent: Int = 60,
 ) {
     fun toJson(): String {
         val o = JSONObject()

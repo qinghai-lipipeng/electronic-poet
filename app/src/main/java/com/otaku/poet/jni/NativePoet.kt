@@ -25,6 +25,16 @@ object NativePoet {
     fun generate(handle: Long, optionsJson: String): String =
         nativeGenerate(handle, optionsJson)
 
+    /** 开始流式生成，返回 `{"title":...,"seed":...}`。 */
+    fun beginGenerate(handle: Long, optionsJson: String): String =
+        nativeBeginGenerate(handle, optionsJson)
+
+    /** 生成下一段，返回 `{"lines":[...],"rhyme":...}` 或 `{"done":true}`。 */
+    fun nextParagraph(handle: Long): String = nativeNextParagraph(handle)
+
+    /** 结束流式生成，返回 warnings 的 JSON 数组。 */
+    fun endGenerate(handle: Long): String = nativeEndGenerate(handle)
+
     /** 释放词库包句柄。 */
     fun close(handle: Long) = nativeClose(handle)
 
@@ -39,6 +49,15 @@ object NativePoet {
 
     @JvmStatic
     private external fun nativeGenerate(handle: Long, optionsJson: String): String
+
+    @JvmStatic
+    private external fun nativeBeginGenerate(handle: Long, optionsJson: String): String
+
+    @JvmStatic
+    private external fun nativeNextParagraph(handle: Long): String
+
+    @JvmStatic
+    private external fun nativeEndGenerate(handle: Long): String
 
     @JvmStatic
     private external fun nativeClose(handle: Long)

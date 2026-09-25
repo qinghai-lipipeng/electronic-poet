@@ -25,6 +25,8 @@ class SettingsStore(private val context: Context) {
         val EVERY_LINE = booleanPreferencesKey("every_line")
         val MAKE_TITLE = booleanPreferencesKey("make_title")
         val SEED = longPreferencesKey("seed")
+        val SHOW_IN_UI = booleanPreferencesKey("show_in_ui")
+        val MEMORY_LIMIT_PERCENT = intPreferencesKey("memory_limit_percent")
     }
 
     data class Saved(
@@ -44,6 +46,8 @@ class SettingsStore(private val context: Context) {
                 everyLine = p[Keys.EVERY_LINE] ?: true,
                 makeTitle = p[Keys.MAKE_TITLE] ?: true,
                 seed = p[Keys.SEED],
+                showInUi = p[Keys.SHOW_IN_UI] ?: false,
+                memoryLimitPercent = (p[Keys.MEMORY_LIMIT_PERCENT] ?: 60).coerceIn(1, 100),
             ),
         )
     }
@@ -62,6 +66,8 @@ class SettingsStore(private val context: Context) {
             p[Keys.EVERY_LINE] = params.everyLine
             p[Keys.MAKE_TITLE] = params.makeTitle
             params.seed?.let { p[Keys.SEED] = it }
+            p[Keys.SHOW_IN_UI] = params.showInUi
+            p[Keys.MEMORY_LIMIT_PERCENT] = params.memoryLimitPercent.coerceIn(1, 100)
         }
     }
 }

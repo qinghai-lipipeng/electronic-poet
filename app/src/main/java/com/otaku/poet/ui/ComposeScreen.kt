@@ -4,6 +4,9 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
@@ -22,13 +25,16 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
@@ -108,7 +114,43 @@ fun ComposeScreen(
                     modifier = Modifier.fillMaxWidth(),
                     enabled = state.active != null && !state.busy,
                 ) {
-                    Text(if (state.busy) "创作中…" else "创 作", modifier = Modifier.padding(4.dp))
+                    if (state.busy) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onPrimary,
+                        )
+                        Text(
+                            "创作中…",
+                            modifier = Modifier.padding(start = 10.dp),
+                        )
+                    } else {
+                        Text("创 作", modifier = Modifier.padding(4.dp))
+                    }
+                }
+            }
+            item {
+                AnimatedVisibility(
+                    visible = state.busy,
+                    enter = fadeIn(),
+                    exit = fadeOut(),
+                ) {
+                    SectionCard {
+                        val progress = if (state.generatingTotal > 0)
+                            (state.generatingProgress.toFloat() / state.generatingTotal).coerceIn(0f, 1f)
+                        else 0f
+                        LinearProgressIndicator(
+                            progress = { progress },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Text(
+                            "已生成 ${state.generatingProgress} / ${state.generatingTotal} 段" +
+                                if (state.params.showInUi) "" else "（仅写入文件，不在界面显示）",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 8.dp),
+                        )
+                    }
                 }
             }
             state.poem?.let { poem ->
@@ -249,6 +291,28 @@ private fun ParamsCard(
                 Icon(Icons.Filled.Casino, contentDescription = "随机种子")
             }
         }
+
+        SwitchRow(
+            label = "界面显示生成内容",
+            description = "关闭时仅写文件、不在界面累积文本，支持超长篇幅不闪退",
+            checked = params.showInUi,
+            onChange = { v -> vm.updateParams { it.copy(showInUi = v) } },
+        )
+
+        Text(
+            "内存上限：可用内存的 ${params.memoryLimitPercent}%",
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.padding(top = 6.dp),
+        )
+        Slider(
+            value = params.memoryLimitPercent.toFloat(),
+            onValueChange = { v ->
+                vm.updateParams { it.copy(memoryLimitPercent = v.toInt().coerceIn(1, 100)) }
+            },
+            valueRange = 1f..100f,
+            steps = 98, // 1% 粒度
+            modifier = Modifier.padding(top = 2.dp),
+        )
     }
 }
 
