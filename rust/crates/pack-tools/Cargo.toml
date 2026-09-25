@@ -1,0 +1,15 @@
+[package]
+name = "pack-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "离线词库包构建工具：拼音归韵、现代诗语料抽取"
+
+[[bin]]
+name = "pack-tools"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1.0"
+jieba-rs = "0.7"
+pinyin = "0.10"

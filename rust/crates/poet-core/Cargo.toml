@@ -1,0 +1,19 @@
+[package]
+name = "poet-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "电子诗人核心：基于语法模板与可挂载词库的现代诗匹配/嵌词引擎（非模型）"
+
+[lib]
+name = "poet_core"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# jni 在 host 上也可编译，便于通过 JVM 做端到端 JNI 验证。
+jni = "0.21"
+
+[dev-dependencies]
+tempfile = "3"
